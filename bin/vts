@@ -1,0 +1,316 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT="$(readlink -f -- "${BASH_SOURCE[0]}")"
+ROOT="$(dirname -- "$(dirname -- "$SCRIPT")")"
+DATA="${VTS_DATA_DIR:-$HOME/.local/share/voice-to-speech}"
+PORT="${VTS_PORT:-8765}"
+PY="$DATA/venv/bin/python"
+URL="http://127.0.0.1:$PORT"
+[[ "$PORT" =~ ^[0-9]+$ ]] && ((PORT >= 1 && PORT <= 65535)) || { printf 'Некоректний порт VTS_PORT.\n' >&2; exit 1; }
+fail() { printf 'Помилка: %s\n' "$*" >&2; exit 1; }
+require_python() { [[ -x "$PY" ]] || fail 'Середовище Python відсутнє. Виконайте ./install.sh.'; }
+socket_installed() { command -v systemctl >/dev/null && systemctl --user cat voice-to-speech.socket >/dev/null 2>&1; }
+probe() { curl --silent --fail --connect-timeout 1 --max-time 2 "$URL/api/status" >/dev/null 2>&1; }
+ensure_up() {
+  probe && return 0
+  if socket_installed; then
+    systemctl --user start voice-to-speech.socket
+  else
+    require_python
+    mkdir -p -- "$DATA"
+    nohup "$SCRIPT" run >>"$DATA/server.log" 2>&1 </dev/null &
+  fi
+  local deadline=$((SECONDS + 60))
+  while ((SECONDS < deadline)); do probe && return 0; sleep 1; done
+  fail "Сервер не відповів протягом 60 секунд. Перевірте vts logs. Адреса: $URL/"
+}
+poll_job() {
+  local job_id="$1" session_id="$2" kind="$3" response fields status percent error status_label output_name
+  while true; do
+    response="$(curl --silent --show-error --fail --max-time 5 "$URL/api/jobs")" || fail 'Втрачено з’єднання із сервером.'
+    fields="$(printf '%s' "$response" | "$PY" -c 'import json,sys; jobs=json.load(sys.stdin)["jobs"]; j=next((j for j in jobs if j["id"]==sys.argv[1]),None); assert j is not None,"Задачу не знайдено"; print(j["status"],round(100*j.get("progress",0)),j.get("error") or "",sep="\t")' "$job_id")"
+    IFS=$'\t' read -r status percent error <<<"$fields"
+    case "$status" in queued) status_label='У черзі';; running) status_label='Обробка';; done) status_label='Готово';; error) status_label='Помилка';; cancelled) status_label='Скасовано';; *) status_label="$status";; esac
+    printf '\rОбробка: %s%% (%s)   ' "$percent" "$status_label"
+    case "$status" in
+      done)
+        output_name='transcript.txt'
+        [[ "$kind" != 'session_hq' ]] || output_name='transcript_hq.txt'
+        printf '\nТранскрипція: %s/recordings/%s/%s\n' "$DATA" "$session_id" "$output_name"
+        return 0
+        ;;
+      error|cancelled) printf '\nЗадача не завершена: %s\n' "${error:-скасовано}" >&2; return 1 ;;
+    esac
+    sleep 2
+  done
+}
+usage() {
+  cat <<'EOF'
+Локальна транскрипція — vts
+  open                      увімкнути сервер і відкрити вебпанель
+  start                     увімкнути сервер
+  stop [--force]            коректно вимкнути сервер
+  status                    показати стан у JSON
+  doctor                    перевірити безпеку сну, GPU та обмеження служби
+  logs                      стежити за журналом
+  run                       запустити сервер у поточному терміналі
+  transcribe ФАЙЛ [--no-wait] завантажити файл для транскрипції
+  resume SESSION_ID          продовжити перервану транскрипцію
+  models                    підготувати моделі Whisper і підсумку (~2,5 ГБ) та llama-server
+  install                   встановити залежності та інтеграцію з системою
+  uninstall                 прибрати інтеграцію, залишити записи й моделі
+  help                      показати довідку
+Змінні: VTS_DATA_DIR, VTS_PORT (типово 8765).
+EOF
+}
+cmd="${1:-help}"
+[[ $# -eq 0 ]] || shift
+case "$cmd" in
+  help|-h|--help) usage ;;
+  run)
+    [[ $# -eq 0 ]] || fail 'Команда run не приймає параметрів; використовуйте VTS_PORT.'
+    require_python
+    shopt -s nullglob
+    libs=("$DATA"/venv/lib/python3*/site-packages/nvidia/*/lib)
+    libpath=""
+    for directory in "${libs[@]}"; do libpath+="${libpath:+:}$directory"; done
+    export LD_LIBRARY_PATH="${libpath}${LD_LIBRARY_PATH:+${libpath:+:}$LD_LIBRARY_PATH}"
+    export PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}"
+    export VTS_DATA_DIR="$DATA" HF_HUB_OFFLINE=1 PYTHONUNBUFFERED=1
+    exec "$PY" -m voice_to_speech --port "$PORT"
+    ;;
+  start) [[ $# -eq 0 ]] || fail 'Невідомі параметри start.'; ensure_up; printf 'Сервер працює: %s/\n' "$URL" ;;
+  open)
+    [[ $# -eq 0 ]] || fail 'Невідомі параметри open.'
+    ensure_up
+    if command -v xdg-open >/dev/null; then xdg-open "$URL/"; else printf 'Відкрийте у браузері: %s/\n' "$URL"; fi
+    ;;
+  stop)
+    force=0
+    if [[ "${1:-}" == '--force' ]]; then force=1; shift; fi
+    [[ $# -eq 0 ]] || fail 'Використання: vts stop [--force]'
+    response="$(curl --silent --show-error --connect-timeout 2 --max-time 10 -w '\n%{http_code}' -X POST "$URL/api/shutdown?force=$force")" || fail 'Не вдалося зв’язатися із сервером.'
+    code="${response##*$'\n'}"
+    if [[ "$code" == 409 ]]; then fail 'Є активні задачі. Для примусового вимкнення: vts stop --force'; fi
+    [[ "$code" == 200 ]] || fail "Сервер відхилив вимкнення (HTTP $code)."
+    printf 'Сервер завершує роботу.\n'
+    ;;
+  status) require_python; curl --silent --show-error --fail --max-time 5 "$URL/api/status" | "$PY" -m json.tool ;;
+  doctor)
+    [[ $# -eq 0 ]] || fail 'Команда doctor не приймає параметрів.'
+    python3 - <<'PY'
+from pathlib import Path
+import re
+import shutil
+import subprocess
+
+def run(*args):
+    try:
+        result = subprocess.run(args, capture_output=True, text=True, timeout=5)
+        return result.stdout.strip() if result.returncode == 0 else None
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+print('Перевірка безпеки зустрічі')
+try:
+    params = Path('/proc/driver/nvidia/params').read_text()
+except OSError:
+    params = ''
+preserve = re.search(r'^PreserveVideoMemoryAllocations:\s*(\S+)', params, re.M)
+temporary = re.search(r'^TemporaryFilePath:\s*(.*)$', params, re.M)
+preserve_ok = bool(preserve and preserve.group(1) == '1')
+temporary_path = temporary.group(1).strip().strip('"') if temporary else ''
+temporary_ok = bool(temporary_path and temporary_path != '(null)')
+print(f"- NVIDIA: PreserveVideoMemoryAllocations={'1' if preserve_ok else 'не налаштовано'}; TemporaryFilePath={temporary_path or 'не налаштовано'}")
+services = ('nvidia-suspend.service', 'nvidia-resume.service', 'nvidia-hibernate.service')
+enabled = {service: run('systemctl', 'is-enabled', service) for service in services}
+print('- NVIDIA sleep services: ' + ', '.join(f'{name}={enabled[name] or "невідомо"}' for name in services))
+if not preserve_ok or not temporary_ok or any(value != 'enabled' for value in enabled.values()):
+    print("  Виправлення вручну: echo 'options nvidia NVreg_PreserveVideoMemoryAllocations=1 NVreg_TemporaryFilePath=/var/tmp' | sudo tee /etc/modprobe.d/nvidia-power.conf && sudo update-initramfs -u")
+    print('  Після цього перезавантажте комп’ютер і перевірте служби NVIDIA.')
+try:
+    mem_sleep = Path('/sys/power/mem_sleep').read_text().strip()
+except OSError:
+    mem_sleep = 'недоступно'
+print(f'- Режим сну: {mem_sleep}. За потреби можна окремо випробувати deep (параметр ядра mem_sleep_default=deep).')
+auto_suspend = run('gsettings', 'get', 'org.gnome.settings-daemon.plugins.power', 'sleep-inactive-ac-type')
+print(f'- GNOME автосон від мережі: {auto_suspend or "невідомо"}. vts блокує сон лише під час роботи.')
+if auto_suspend and auto_suspend != "'nothing'":
+    print("  На дні зустрічей: gsettings set org.gnome.settings-daemon.plugins.power sleep-inactive-ac-type 'nothing'")
+journal = run('journalctl', '-b', '-1', '-k', '--no-pager')
+print('- Помилки GPU попереднього запуску: ' + (str(len(re.findall(r'Error while waiting for GPU progress|Xid', journal))) if journal is not None else 'журнал недоступний'))
+memory = run('nvidia-smi', '--query-gpu=memory.total,memory.free', '--format=csv,noheader,nounits')
+print('- VRAM зараз: ' + (memory.splitlines()[0] + ' МіБ (всього, вільно)' if memory else 'недоступно'))
+print('- Блокування сну: ' + ('systemd-inhibit доступний' if shutil.which('systemd-inhibit') else 'systemd-inhibit відсутній'))
+limits = run('systemctl', '--user', 'show', 'voice-to-speech.service', '-p', 'MemoryMax', '-p', 'OOMScoreAdjust')
+print('- Ліміти служби: ' + (limits.replace('\n', '; ') if limits else 'недоступно'))
+PY
+    ;;
+  logs)
+    if socket_installed; then exec journalctl --user -u voice-to-speech -f; fi
+    mkdir -p -- "$DATA"; touch "$DATA/server.log"; exec tail -f "$DATA/server.log"
+    ;;
+  transcribe)
+    [[ $# -ge 1 ]] || fail 'Використання: vts transcribe ФАЙЛ [--no-wait]'
+    input="$1"; shift; wait_for_job=1
+    if [[ "${1:-}" == '--no-wait' ]]; then wait_for_job=0; shift; fi
+    [[ $# -eq 0 && -f "$input" ]] || fail 'Вкажіть наявний файл і необов’язковий --no-wait.'
+    require_python; ensure_up
+    response="$(curl --silent --show-error --fail-with-body -F "file=@$input" "$URL/api/jobs/upload")" || fail 'Не вдалося завантажити файл.'
+    fields="$(printf '%s' "$response" | "$PY" -c 'import json,sys; j=json.load(sys.stdin)["job"]; print(j["id"],j["session_id"],j["kind"],sep="\t")')"
+    IFS=$'\t' read -r job_id session_id kind <<<"$fields"
+    printf 'Задача: %s\n' "$job_id"
+    ((wait_for_job)) || exit 0
+    poll_job "$job_id" "$session_id" "$kind"
+    ;;
+  resume)
+    [[ $# -eq 1 ]] || fail 'Використання: vts resume SESSION_ID'
+    session_id="$1"
+    [[ "$session_id" =~ ^(meeting|upload)_[0-9_-]+$ ]] || fail 'Некоректний ідентифікатор сесії.'
+    require_python; ensure_up
+    response="$(curl --silent --show-error --fail-with-body --max-time 10 -X POST "$URL/api/sessions/$session_id/resume")" || fail 'Не вдалося продовжити задачу.'
+    fields="$(printf '%s' "$response" | "$PY" -c 'import json,sys; j=json.load(sys.stdin)["job"]; print(j["id"],j["session_id"],j["kind"],sep="\t")')"
+    IFS=$'\t' read -r job_id session_id kind <<<"$fields"
+    printf 'Задачу продовжено: %s\n' "$job_id"
+    poll_job "$job_id" "$session_id" "$kind"
+    ;;
+  models)
+    [[ $# -eq 0 ]] || fail 'Команда models не приймає параметрів.'
+    require_python
+    HF_HUB_OFFLINE=0 HF_XET_HIGH_PERFORMANCE=1 PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" "$PY" - "$DATA" <<'PY'
+import hashlib
+import os
+from pathlib import Path
+import shutil
+import sys
+import tarfile
+import tempfile
+import urllib.request
+
+data_dir = Path(sys.argv[1])
+root = data_dir / "models"
+from voice_to_speech.config import LLM_MODEL_FILE, LLM_MODEL_REPO
+
+LLAMA_TAG = "b12483"
+LLAMA_ASSET = "llama-b12483-bin-ubuntu-cuda-12.8-x64.tar.gz"
+LLAMA_SHA256 = "ec75f6fea778bd8af506f7c4df95e503779c9e8e64e815cf3cf3d32cb41a8a87"
+LLAMA_URL = f"https://github.com/ggml-org/llama.cpp/releases/download/{LLAMA_TAG}/{LLAMA_ASSET}"
+llm_dir = data_dir / "llm"
+version_dir = llm_dir / f"llama.cpp-{LLAMA_TAG}"
+wrapper = llm_dir / "bin" / "llama-server"
+
+override_server = os.environ.get("VTS_LLAMA_SERVER")
+if override_server and Path(override_server).expanduser().is_file() and os.access(Path(override_server).expanduser(), os.X_OK):
+    smoke_path = Path(override_server).expanduser()
+    print(f"llama-server: використовую VTS_LLAMA_SERVER={smoke_path}")
+else:
+    smoke_path = wrapper
+    server_binary = next(iter(version_dir.rglob("llama-server")), None) if version_dir.exists() else None
+    if server_binary and wrapper.is_file() and os.access(wrapper, os.X_OK):
+        print(f"llama-server {LLAMA_TAG}: готовий ({wrapper})")
+    else:
+        print(f"llama-server {LLAMA_TAG}: завантажую офіційний CUDA build ({LLAMA_ASSET}).")
+        llm_dir.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix="vts-llama-") as temporary_dir:
+            archive = Path(temporary_dir) / LLAMA_ASSET
+            digest = hashlib.sha256()
+            with urllib.request.urlopen(LLAMA_URL, timeout=60) as response, archive.open("wb") as output:
+                while chunk := response.read(1024 * 1024):
+                    digest.update(chunk)
+                    output.write(chunk)
+            actual_sha256 = digest.hexdigest()
+            if actual_sha256 != LLAMA_SHA256:
+                raise SystemExit(f"Помилка: SHA-256 llama-server не збігається: {actual_sha256}")
+            if version_dir.exists():
+                shutil.rmtree(version_dir)
+            version_dir.mkdir(parents=True)
+            with tarfile.open(archive, "r:gz") as bundle:
+                bundle.extractall(version_dir, filter="data")
+        server_binary = next(iter(version_dir.rglob("llama-server")), None)
+        if server_binary is None:
+            raise SystemExit("Помилка: в архіві llama.cpp не знайдено llama-server.")
+        server_binary.chmod(server_binary.stat().st_mode | 0o111)
+        wrapper.parent.mkdir(parents=True, exist_ok=True)
+        relative_binary = server_binary.relative_to(version_dir)
+        binary_dir = relative_binary.parent
+        binary_name = relative_binary.name
+        wrapper.write_text(
+            "#!/usr/bin/env bash\nset -euo pipefail\n"
+            f'ROOT="$(dirname -- "$(dirname -- "$(readlink -f -- "${{BASH_SOURCE[0]}}")")")"\n'
+            f'LLAMA_DIR="$ROOT/{version_dir.name}/{binary_dir}"\n'
+            'export LD_LIBRARY_PATH="$LLAMA_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"\n'
+            f'exec "$LLAMA_DIR/{binary_name}" "$@"\n',
+            encoding="utf-8",
+        )
+        wrapper.chmod(0o755)
+        print(f"llama-server: перевірено SHA-256 {actual_sha256}")
+    try:
+        import subprocess
+        smoke = subprocess.run([str(smoke_path), "--version"], check=True, capture_output=True, text=True, timeout=30)
+        print(f"llama-server smoke check: {smoke.stdout.strip() or smoke.stderr.strip()}")
+    except (OSError, subprocess.SubprocessError) as error:
+        print(f"Увага: llama-server --version не пройшов: {error}")
+
+model_path = Path(os.environ.get("VTS_LLM_MODEL") or root / "llm" / LLM_MODEL_FILE).expanduser()
+if os.environ.get("VTS_LLM_MODEL") and model_path.is_file():
+    print(f"Модель підсумку: використовую VTS_LLM_MODEL={model_path}")
+elif model_path.is_file():
+    print(f"Модель підсумку: готова ({model_path})")
+else:
+    print(f"Модель підсумку: перевіряю кеш Hugging Face або завантажую {LLM_MODEL_REPO}/{LLM_MODEL_FILE}.")
+    from huggingface_hub import hf_hub_download
+    cached_model = Path(hf_hub_download(repo_id=LLM_MODEL_REPO, filename=LLM_MODEL_FILE))
+    model_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        os.link(cached_model, model_path)
+    except OSError:
+        shutil.copy2(cached_model, model_path)
+    if not model_path.is_file():
+        raise SystemExit(f"Модель підсумку неповна: немає {model_path}.")
+print(f"Модель підсумку готова: {model_path}")
+
+repositories = {"large-v3-turbo": "mobiuslabsgmbh/faster-whisper-large-v3-turbo", "large-v3": "Systran/faster-whisper-large-v3"}
+for name, repository in repositories.items():
+    target = root / name
+    if (target / "model.bin").is_file():
+        print(f"Модель {name}: готова ({target})")
+        continue
+    cache = Path.home() / ".cache/huggingface/hub" / ("models--" + repository.replace("/", "--")) / "snapshots"
+    snapshots = sorted(cache.glob("*"), key=lambda p: p.stat().st_mtime, reverse=True) if cache.exists() else []
+    snapshot = next((p for p in snapshots if (p / "model.bin").is_file()), None)
+    if snapshot:
+        print(f"Модель {name}: використовую локальний кеш.")
+        target.mkdir(parents=True, exist_ok=True)
+        for source in snapshot.rglob("*"):
+            destination = target / source.relative_to(snapshot)
+            if source.is_dir():
+                destination.mkdir(parents=True, exist_ok=True)
+            elif source.is_file():
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                if not destination.exists():
+                    try:
+                        os.link(source.resolve(), destination)
+                    except OSError:
+                        shutil.copy2(source.resolve(), destination)
+    else:
+        print(f"Модель {name}: потрібен інтернет; завантажую до {target}.")
+        from huggingface_hub import snapshot_download
+        snapshot_download(repository, local_dir=str(target), max_workers=16)
+    if not (target / "model.bin").is_file():
+        raise SystemExit(f"Модель {name} неповна: немає model.bin.")
+print("Обидві моделі готові до автономної роботи.")
+PY
+    ;;
+  install) exec "$ROOT/install.sh" "$@" ;;
+  uninstall)
+    systemctl --user stop voice-to-speech.service voice-to-speech.socket 2>/dev/null || true
+    systemctl --user disable voice-to-speech.socket 2>/dev/null || true
+    rm -f -- "$HOME/.config/systemd/user/voice-to-speech.service" "$HOME/.config/systemd/user/voice-to-speech.socket" "$HOME/.local/share/applications/voice-to-speech.desktop"
+    if [[ -L "$HOME/.local/bin/vts" && "$(readlink -f "$HOME/.local/bin/vts")" == "$SCRIPT" ]]; then rm -- "$HOME/.local/bin/vts"; fi
+    systemctl --user daemon-reload 2>/dev/null || true
+    if command -v update-desktop-database >/dev/null; then update-desktop-database "$HOME/.local/share/applications"; fi
+    printf 'Інтеграцію прибрано. Збережено дані, записи, моделі та venv: %s\nЗбережено проєкт: %s\n' "$DATA" "$ROOT"
+    ;;
+  *) usage >&2; fail "Невідома команда: $cmd" ;;
+esac

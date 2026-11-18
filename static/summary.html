@@ -1,0 +1,191 @@
+<!doctype html>
+<html lang="uk">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="theme-color" content="#101418">
+<title>Підсумки зустрічей</title>
+<style>
+:root{color-scheme:dark;--bg:#101418;--panel:#1b2229;--line:#34414b;--muted:#9eafbd;--text:#eef4f8;--green:#77e4a9;--blue:#75ccfa}*{box-sizing:border-box}body{max-width:980px;margin:auto;padding:24px;font:15px/1.5 system-ui,sans-serif;background:var(--bg);color:var(--text)}h1{font-size:1.7rem;margin:0}h2{font-size:1.15rem;margin:0}h3{font-size:1rem;margin:10px 0 5px}p{margin:8px 0}.muted,.hint{color:var(--muted)}.hint{font-size:.9rem}.good{color:var(--green)}.warn{color:#ffce7a}.row{display:flex;align-items:center;gap:10px;flex-wrap:wrap}.spread{justify-content:space-between}.panel,.card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:18px;margin:16px 0}.card{margin:12px 0}.pill{padding:5px 10px;border-radius:20px;border:1px solid var(--line);background:#18252e;font-size:.88rem;max-width:100%;overflow-wrap:anywhere}button,select,input,a.download{font:inherit}button,select,a.download{color:var(--text);background:#26343f;border:1px solid #4a5a66;border-radius:7px;padding:8px 12px}button,a.download{cursor:pointer;text-decoration:none}button:hover,a.download:hover{border-color:#8ca0af}button:disabled{opacity:.5;cursor:wait}.primary{background:#087744;border-color:#1bac69}.danger{background:#743236;border-color:#ba5c62}.small{padding:5px 9px;font-size:.9rem}select{max-width:100%;min-width:220px}input[type=file]{max-width:100%}input[type=checkbox]{accent-color:#33bf83}progress{width:100%;height:17px;accent-color:#35bf85}.job-state{margin:12px 0;padding:12px;border:1px solid var(--line);border-radius:8px;background:#162029}.markdown{margin-top:12px;padding:14px;background:#10181e;border:1px solid var(--line);border-radius:8px;overflow-wrap:anywhere}.markdown h1{font-size:1.35rem}.markdown h2{margin-top:16px}.markdown ul{padding-left:22px}.markdown li{margin:3px 0}.markdown input{margin-right:7px}#message:empty,#uploadMessage:empty{display:none}details summary{cursor:pointer;font-weight:600}a{color:var(--blue)}a.download{color:var(--text)}@media(max-width:640px){body{padding:14px}.panel,.card{padding:14px}.row>*{max-width:100%}select{width:100%}.card-actions button,.card-actions a{flex:1 1 auto;text-align:center}}
+</style>
+</head>
+<body>
+<header><div class="row spread"><h1>Підсумки зустрічей</h1><a href="/">← До транскрипції</a></div><p id="llmStatus" class="pill warn" role="status">Перевірка моделі…</p></header>
+<main>
+<section class="panel" aria-labelledby="sessionsTitle"><div class="row spread"><h2 id="sessionsTitle">Записані сесії</h2><button id="refresh" class="small" type="button">Оновити</button></div><p id="message" class="warn" role="status"></p><div id="sessions"><p class="muted">Завантаження…</p></div></section>
+<p class="hint">Обробка 2–3-годинної зустрічі може тривати довго. Під час запису або транскрипції модель підсумків чекає, щоб не займати відеопам’ять.</p>
+<details class="panel"><summary>Підсумувати інший текстовий файл</summary><p class="hint">Підтримуються .txt, .srt і .md до 20 МіБ.</p><div class="row"><input id="uploadFile" type="file" accept=".txt,.srt,.md,text/plain,text/markdown" aria-label="Текстовий файл"><button id="upload" class="primary" type="button" disabled>Завантажити й підсумувати</button></div><p id="uploadMessage" class="warn" role="status"></p></details>
+</main>
+<script>
+(() => {
+'use strict';
+const $ = id => document.getElementById(id);
+const node = (tag, text, cls) => { const el = document.createElement(tag); if (text !== undefined) el.textContent = String(text); if (cls) el.className = cls; return el; };
+const jobs = new Map(), choices = new Map(), expanded = new Set(), markdownCache = new Map();
+let sources = [], ready = false, socket, retries = 0, retryTimer;
+const labels = {queued:'У черзі',running:'Обробка',done:'Готово',error:'Помилка',cancelled:'Скасовано'};
+const fileLabels = {'transcript_hq.txt':'Якісна транскрипція','transcript.txt':'Транскрипція','transcript_hq.srt':'Якісні субтитри','summary_input.txt':'Вхідний текст','summary_input.srt':'Вхідний текст','summary_input.md':'Вхідний текст'};
+function errorText(data, fallback) { const detail = data && (data.detail || data.error); return typeof detail === 'string' ? detail : fallback; }
+async function api(path, options = {}) { const response = await fetch(path, options); let data = {}; try { data = await response.json(); } catch {} if (!response.ok) throw new Error(errorText(data, `Помилка сервера (${response.status}).`)); return data; }
+const post = (path, data) => api(path, {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data || {})});
+function time(value) { const seconds = Math.max(0,Math.floor(Number(value) || 0)); return `${Math.floor(seconds / 3600)}:${String(Math.floor(seconds / 60) % 60).padStart(2,'0')}:${String(seconds % 60).padStart(2,'0')}`; }
+function validId(id) { return /^(meeting|upload|summary)_[0-9_-]+$/.test(id); }
+function fileUrl(id, name) { return validId(id) && ['summary.md','summary_source.txt'].includes(name) ? `/recordings/${encodeURIComponent(id)}/${name}` : '#'; }
+function formatDate(source) {
+  const raw = source.started_at || source.created_at || source.session_id.replace(/^[^_]+_/, '').replace(/_(\d{2})-(\d{2})-(\d{2})/, 'T$1:$2:$3');
+  const value = new Date(raw);
+  return Number.isNaN(value.getTime()) ? source.session_id : value.toLocaleString('uk-UA', {dateStyle:'medium',timeStyle:'short'});
+}
+function sourceNames(value) {
+  if (!value) return '';
+  const items = Array.isArray(value) ? value : Object.keys(value).filter(key => value[key]);
+  return items.map(item => item === 'system' ? 'Система' : item === 'mic' ? 'Мікрофон' : item).join(', ');
+}
+function groupSources() {
+  const groups = new Map();
+  for (const source of sources) {
+    if (!validId(source.session_id)) continue;
+    if (!groups.has(source.session_id)) groups.set(source.session_id, []);
+    groups.get(source.session_id).push(source);
+  }
+  return [...groups].sort((a,b) => String(b[1][0].started_at || b[1][0].created_at || b[0].split('_').slice(1).join('_')).localeCompare(String(a[1][0].started_at || a[1][0].created_at || a[0].split('_').slice(1).join('_'))));
+}
+function sessionJob(id) {
+  const all = [...jobs.values()].filter(job => job.kind === 'summary' && job.session_id === id);
+  return all.find(job => ['queued','running'].includes(job.status)) || all.sort((a,b) => String(b.created_at || '').localeCompare(String(a.created_at || '')))[0];
+}
+function appendBold(parent, value) {
+  for (const part of value.split(/(\*\*[^*]+\*\*)/g)) {
+    if (part.startsWith('**') && part.endsWith('**')) parent.append(node('strong',part.slice(2,-2)));
+    else if (part) parent.append(document.createTextNode(part));
+  }
+}
+function renderMarkdown(container, text) {
+  container.replaceChildren();
+  let list = null, paragraph = null;
+  for (const raw of text.split(/\r?\n/)) {
+    const line = raw.trim();
+    if (!line) { list = null; paragraph = null; continue; }
+    const heading = /^(#{1,3})\s+(.+)$/.exec(line);
+    if (heading) { list = null; paragraph = null; const el = node(`h${heading[1].length}`); appendBold(el,heading[2]); container.append(el); continue; }
+    const bullet = /^[-*]\s+(.*)$/.exec(line);
+    if (bullet) {
+      paragraph = null;
+      if (!list) { list = node('ul'); container.append(list); }
+      const item = node('li'), task = /^\[([ xX])\]\s*(.*)$/.exec(bullet[1]);
+      if (task) { const check = node('input'); check.type = 'checkbox'; check.disabled = true; check.checked = task[1].toLowerCase() === 'x'; item.append(check); appendBold(item,task[2]); }
+      else appendBold(item,bullet[1]);
+      list.append(item); continue;
+    }
+    list = null;
+    if (!paragraph) { paragraph = node('p'); container.append(paragraph); }
+    else paragraph.append(document.createTextNode(' '));
+    appendBold(paragraph,line);
+  }
+}
+async function showMarkdown(id, box) {
+  const url = fileUrl(id,'summary.md');
+  if (url === '#') return;
+  box.replaceChildren(node('p','Завантаження підсумку…','muted'));
+  try {
+    if (!markdownCache.has(id)) {
+      const response = await fetch(url);
+      if (!response.ok) throw new Error(`Не вдалося відкрити підсумок (${response.status}).`);
+      markdownCache.set(id,await response.text());
+    }
+    if (expanded.has(id)) renderMarkdown(box,markdownCache.get(id));
+  } catch (e) { box.replaceChildren(node('p',e.message,'warn')); }
+}
+function renderJob(job, card) {
+  if (!job || job.status === 'done') return;
+  const box = node('div',undefined,'job-state');
+  box.append(node('strong',labels[job.status] || job.status));
+  if (job.stage) box.append(node('p',job.stage,'hint'));
+  if (['queued','running'].includes(job.status)) {
+    const progress = node('progress'); progress.max = 1; progress.value = Math.max(0,Math.min(1,Number(job.progress) || 0)); box.append(progress);
+    box.append(node('p',`${Math.round(progress.value * 100)}%${job.eta_s == null ? '' : ` · залишилось приблизно ${time(job.eta_s)}`}`,'hint'));
+    const cancel = node('button','Скасувати','small danger'); cancel.type = 'button';
+    cancel.onclick = async () => { cancel.disabled = true; try { const result = await post(`/api/jobs/${encodeURIComponent(job.id)}/cancel`); updateJob(result.job || result); } catch (e) { $('message').textContent = e.message; cancel.disabled = false; } };
+    box.append(cancel);
+  } else if (['error','cancelled'].includes(job.status)) {
+    if (job.error) box.append(node('p',job.error,'warn'));
+    const resume = node('button','Продовжити','small primary'); resume.type = 'button'; resume.disabled = !ready;
+    resume.onclick = async () => { resume.disabled = true; try { const result = await post(`/api/jobs/${encodeURIComponent(job.id)}/resume`); updateJob(result.job || result); } catch (e) { $('message').textContent = e.message; resume.disabled = !ready; } };
+    box.append(resume);
+  }
+  card.append(box);
+}
+function render() {
+  const host = $('sessions'); host.replaceChildren();
+  const groups = groupSources();
+  if (!groups.length) { host.append(node('p','Ще немає записаних сесій з транскрипцією.','muted')); return; }
+  for (const [id, files] of groups) {
+    const source = files[0], card = node('article',undefined,'card');
+    const top = node('div',undefined,'row spread');
+    const title = node('div'); title.append(node('h3',source.original_filename || (id.startsWith('meeting_') ? 'Зустріч' : 'Файл')));
+    title.append(node('span',`${formatDate(source)} · ${id.startsWith('meeting_') ? 'Зустріч' : 'Файл'}`,'hint'));
+    top.append(title); card.append(top);
+    const names = sourceNames(source.sources) || (id.startsWith('meeting_') ? 'Не вказано' : 'Файл');
+    card.append(node('p',`Джерела: ${names}`,'hint'));
+    if (source.ended_at && source.started_at) {
+      const length = (new Date(source.ended_at) - new Date(source.started_at)) / 1000;
+      if (Number.isFinite(length) && length >= 0) card.append(node('p',`Тривалість: ${time(length)}`,'hint'));
+    }
+    const order = ['transcript_hq.txt','transcript.txt','transcript_hq.srt'];
+    const preferred = [...files].sort((a,b) => (order.indexOf(a.file) < 0 ? 99 : order.indexOf(a.file)) - (order.indexOf(b.file) < 0 ? 99 : order.indexOf(b.file)))[0];
+    let selected = files.find(item => item.file === choices.get(id)) || preferred;
+    const picker = node('div',undefined,'row'); picker.append(node('span','Транскрипт:'));
+    if (files.length > 1) {
+      const select = node('select'); select.setAttribute('aria-label',`Транскрипт для ${id}`);
+      for (const file of files) select.append(new Option(`${fileLabels[file.file] || file.file} · ${Math.round(file.size / 1024)} КіБ`,file.file));
+      select.value = selected.file; select.onchange = () => { choices.set(id,select.value); }; picker.append(select);
+    } else picker.append(node('span',fileLabels[selected.file] || selected.file,'muted'));
+    card.append(picker);
+    const job = sessionJob(id), actions = node('div',undefined,'row card-actions'); actions.style.marginTop = '12px';
+    const hasSummary = files.some(item => item.has_summary);
+    const run = node('button',hasSummary ? 'Оновити підсумок' : 'Зробити підсумок','primary'); run.type = 'button'; run.disabled = !ready || !!(job && ['queued','running'].includes(job.status));
+    run.onclick = async () => { run.disabled = true; $('message').textContent = ''; try { selected = files.find(item => item.file === (choices.get(id) || selected.file)) || selected; const result = await post('/api/jobs/summary',{session_id:id,file:selected.file}); updateJob(result.job || result); } catch (e) { $('message').textContent = e.message; run.disabled = !ready; } };
+    actions.append(run);
+    if (hasSummary) {
+      const show = node('button',expanded.has(id) ? 'Сховати підсумок' : 'Показати підсумок'); show.type = 'button'; show.setAttribute('aria-expanded',String(expanded.has(id)));
+      const markdown = node('div',undefined,'markdown'); markdown.hidden = !expanded.has(id);
+      show.onclick = () => { if (expanded.has(id)) expanded.delete(id); else expanded.add(id); markdown.hidden = !expanded.has(id); show.textContent = expanded.has(id) ? 'Сховати підсумок' : 'Показати підсумок'; show.setAttribute('aria-expanded',String(expanded.has(id))); if (expanded.has(id)) showMarkdown(id,markdown); };
+      actions.append(show);
+      const download = node('a','Завантажити .md','download'); download.href = fileUrl(id,'summary.md'); download.download = 'summary.md'; actions.append(download);
+      if (files.some(item => item.has_summary_source)) { const input = node('a','Текст без дублів','download'); input.href = fileUrl(id,'summary_source.txt'); input.download = 'summary_source.txt'; actions.append(input); }
+      card.append(actions); card.append(markdown); if (expanded.has(id)) showMarkdown(id,markdown);
+    } else card.append(actions);
+    renderJob(job,card); host.append(card);
+  }
+}
+function updateJob(job) {
+  if (!job || job.kind !== 'summary' || !job.id) return;
+  jobs.set(job.id,job); render();
+  if (['done','error','cancelled'].includes(job.status)) { if (job.status === 'done') markdownCache.delete(job.session_id); loadSources(); }
+}
+async function loadSources() { try { sources = (await api('/api/summary/sources')).sources || []; $('message').textContent = ''; render(); } catch (e) { $('message').textContent = e.message; } }
+async function loadJobs() { try { for (const job of (await api('/api/jobs')).jobs || []) if (job.kind === 'summary') jobs.set(job.id,job); render(); } catch (e) { $('message').textContent = e.message; } }
+async function loadStatus() { try { const status = await api('/api/llm/status'); ready = !!status.ready; $('llmStatus').textContent = ready ? `Модель: ${status.model}` : status.hint || 'Модель підсумків недоступна.'; $('llmStatus').className = `pill ${ready ? 'good' : 'warn'}`; } catch (e) { ready = false; $('llmStatus').textContent = e.message; $('llmStatus').className = 'pill warn'; } $('upload').disabled = !ready; render(); }
+function connect() {
+  socket = new WebSocket(`ws://${location.host}/ws`);
+  socket.onopen = () => { retries = 0; clearTimeout(retryTimer); loadJobs(); loadSources(); loadStatus(); };
+  socket.onmessage = event => { let data; try { data = JSON.parse(event.data); } catch { return; } if (data.type === 'job') updateJob(data.job || data); };
+  socket.onclose = () => { const delay = Math.min(1000 * 2 ** retries,10000); retries = Math.min(retries + 1,4); retryTimer = setTimeout(connect,delay); };
+  socket.onerror = () => socket.close();
+}
+$('refresh').onclick = () => { loadSources(); loadJobs(); loadStatus(); };
+$('upload').onclick = async () => {
+  const file = $('uploadFile').files[0];
+  if (!file) { $('uploadMessage').textContent = 'Спочатку виберіть файл.'; return; }
+  if (!/\.(txt|srt|md)$/i.test(file.name)) { $('uploadMessage').textContent = 'Підтримуються лише .txt, .srt і .md.'; return; }
+  if (file.size > 20 * 1024 ** 2) { $('uploadMessage').textContent = 'Файл перевищує ліміт 20 МіБ.'; return; }
+  $('upload').disabled = true; $('uploadMessage').textContent = 'Завантаження…';
+  const body = new FormData(); body.append('file',file);
+  try { const result = await api('/api/jobs/summary/upload',{method:'POST',body}); $('uploadMessage').textContent = 'Файл додано до черги.'; $('uploadFile').value = ''; updateJob(result.job || result); await loadSources(); }
+  catch (e) { $('uploadMessage').textContent = e.message; }
+  finally { $('upload').disabled = !ready; }
+};
+Promise.all([loadSources(),loadJobs(),loadStatus()]).then(connect);
+setInterval(() => { loadSources(); loadStatus(); },30000);
+})();
+</script>
+</body>
+</html>
