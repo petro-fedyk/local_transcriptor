@@ -9,7 +9,7 @@ from urllib import error
 import pytest
 
 from voice_to_speech.config import Config
-from voice_to_speech.summary import (LlamaServer, Row, SummaryManager, chunk_rows,
+from voice_to_speech.summary import (LlamaServer, Row, SummaryManager, _clean_summary, chunk_rows,
                                      dedupe_rows, format_rows, parse_transcript, summarize)
 
 
@@ -70,36 +70,100 @@ def test_chunk_rows_respects_size_and_order():
     assert all(len(format_rows(chunk)) <= 50 for chunk in timed)
 
 
-def test_summarize_resume_and_hierarchical_reduce():
-    rows = [Row(None, None, None, "слово " * 1400) for _ in range(3)]
+def note(title, summary, decisions=None, tasks=None, questions=None):
+    return {"title": title, "summary": summary, "decisions": decisions or [],
+            "tasks": tasks or [], "open_questions": questions or []}
+
+
+def test_summarize_renders_exact_markdown_from_json(monkeypatch):
+    responses = [note("План", "Обговорили план.", ["Погодили план."],
+                      [{"who": "Олена", "what": "підготувати звіт", "due": "до п'ятниці"},
+                       {"who": "", "what": "перевірити цифри", "due": ""}]),
+                 note("Бюджет", "Оцінили бюджет.", questions=["Який ліміт?"])]
     calls = []
-    def chat(messages, max_tokens):
-        prompt = messages[-1]["content"]
-        calls.append(prompt)
-        if "Зроби стислий конспект" in prompt:
-            return "<think>hidden</think>### 00:00–00:01\n" + "- Факт.\n" * 1500
-        if "Зведи ці нотатки" in prompt:
-            return "<think>hidden</think>- Стислий факт."
-        return "# Підсумок зустрічі\n## Коротко\n- Факт\n## Теми\nНемає.\n## Рішення\nНемає.\n## Завдання\nНемає.\n## Відкриті питання\nНемає."
-    state = {"notes": {"0": "### 00:00–00:01\n" + "- Факт.\n" * 1500}}
-    output = summarize(rows, chat, lambda *args: None, lambda: False, state)
-    assert all(heading in output for heading in ("# Підсумок зустрічі", "## Коротко", "## Теми", "## Рішення", "## Завдання", "## Відкриті питання"))
-    assert "hidden" not in output
-    assert any("Зведи ці нотатки" in call for call in calls)
-    assert sum("Зроби стислий конспект" in call for call in calls) == len(chunk_rows(rows)) - 1
+    def chat(messages, max_tokens, temperature=.3, schema=None):
+        calls.append(schema)
+        return json.dumps({"overview": ["План і бюджет."]} if "overview" in schema["properties"] else responses.pop(0))
+    rows = [Row(1, 4, "system", "План"), Row(65, 80, "system", "Бюджет")]
+    monkeypatch.setattr("voice_to_speech.summary.chunk_rows", lambda value: [[value[0]], [value[1]]])
+    output = summarize(rows, chat, lambda *_: None, lambda: False, {})
+    assert output == ("# Підсумок зустрічі\n\n## Коротко\n- План і бюджет.\n\n"
+                      "## Теми\n### План (00:00–00:00)\nОбговорили план.\n\n"
+                      "### Бюджет (00:01–00:01)\nОцінили бюджет.\n\n"
+                      "## Рішення\n- Погодили план.\n\n"
+                      "## Завдання\n- [ ] Олена — підготувати звіт — до п'ятниці\n"
+                      "- [ ] перевірити цифри\n\n## Відкриті питання\n- Який ліміт?")
+    assert len(calls) == 3 and all(calls)
 
 
-def test_summarize_fills_missing_final_sections():
-    def chat(messages, max_tokens):
-        if "Зроби стислий конспект" in messages[-1]["content"]:
-            return "### без часу\n- Факт"
-        return "<think>hidden</think>## Коротко\n- Факт"
-    output = summarize([Row(None, None, None, "Факт")], chat,
+def test_summarize_merges_adjacent_topics_and_dedupes():
+    rows = [Row(1, 10, None, "A " * 2300), Row(20, 30, None, "B " * 2300)]
+    responses = [note("Закупівля обладнання", "Знайшли варіанти.", ["Порівняти пропозиції."],
+                      [{"who": "Іра", "what": "зібрати ціни", "due": ""}], ["Коли замовляти?"]),
+                 note("Закупівля обладнання", "Перевірили ціни.", ["Порівняти пропозиції!"],
+                      [{"who": "Іра", "what": "зібрати ціни", "due": ""}], ["Коли замовляти?"])]
+    def chat(messages, max_tokens, temperature=.3, schema=None):
+        return json.dumps({"overview": ["Обговорили закупівлю."]} if "overview" in schema["properties"] else responses.pop(0))
+    output = summarize(rows, chat, lambda *_: None, lambda: False, {})
+    assert output.count("### Закупівля обладнання") == 1
+    assert output.count("- Порівняти пропозиції.") == 1
+    assert output.count("- [ ] Іра — зібрати ціни") == 1
+    assert output.count("- Коли замовляти?") == 1
+
+
+def test_invalid_json_retries_then_falls_back_and_strips_markup():
+    calls = []
+    def chat(messages, max_tokens, temperature=.3, schema=None):
+        calls.append(temperature)
+        return '{bad' if "title" in schema["properties"] else '{"overview": []}'
+    output = summarize([Row(None, None, None, "**Факт**\nще факт")], chat,
                        lambda *_: None, lambda: False, {})
-    assert output.startswith("# Підсумок зустрічі\n\n## Коротко\n- Факт")
-    assert output.count("## ") == 5
+    assert calls == [.3, .1, .3]
+    assert "### Частина 1\nФакт ще факт" in output
     assert output.endswith("## Відкриті питання\nНемає.")
-    assert "hidden" not in output
+
+
+def test_resume_format_two_skips_cached_chunk_and_format_one_restarts():
+    rows = [Row(1, 2, None, "Факт")]
+    calls = []
+    def chat(messages, max_tokens, temperature=.3, schema=None):
+        calls.append(schema)
+        if "overview" in schema["properties"]:
+            return "```json\n{\"overview\": [\"Факт.\"]}\n```"
+        return "<think>hidden</think>" + json.dumps(note("Тема", "Факт."))
+    state = {"format": 2, "notes": {"0": note("Кеш", "Кешований факт.")}}
+    assert "### Кеш" in summarize(rows, chat, lambda *_: None, lambda: False, state)
+    assert len(calls) == 1
+    state = {"format": 1, "notes": {"0": "old markdown"}}
+    assert "### Тема" in summarize(rows, chat, lambda *_: None, lambda: False, state)
+    assert state["format"] == 2 and isinstance(state["notes"]["0"], dict)
+    assert len(calls) == 3
+
+
+def test_clean_summary_removes_echoed_template_and_formats_brief():
+    bad = """# Підсумок зустрічі
+
+## Коротко
+### Коротко (3–6 маркерів)
+Зустріч була зосереджена на закупівлі обладнання. Команда порівняє пропозиції.
+
+## Теми
+### Перевірка пропозицій (00:00–00:06)
+*   **Назва (00:00–00:06)**: Обговорення пропозицій постачальників.
+*   **Опис:** Порівняли ціни.
+"""
+    result = _clean_summary(bad)
+    assert "маркерів" not in result
+    assert "**Назва" not in result
+    assert "**Опис" not in result
+    assert "### Коротко" not in result
+    assert "- Зустріч була зосереджена на закупівлі обладнання." in result
+    assert "- Команда порівняє пропозиції." in result
+    assert "### Перевірка пропозицій (00:00–00:06)\nОбговорення пропозицій постачальників.\nПорівняли ціни." in result
+    assert [line for line in result.splitlines() if line.startswith("## ")] == [
+        "## Коротко", "## Теми", "## Рішення", "## Завдання", "## Відкриті питання",
+    ]
+    assert result.endswith("## Відкриті питання\nНемає.")
 
 
 class FakeServer:
@@ -121,13 +185,13 @@ class FakeServer:
     def stop(self):
         pass
 
-    def chat(self, messages, max_tokens):
+    def chat(self, messages, max_tokens, temperature=.3, schema=None):
         type(self).entered.set()
         if type(self).block:
             type(self).release.wait(5)
-        if "Зроби стислий конспект" in messages[-1]["content"]:
-            return "### 00:00–00:01\n- Факт"
-        return "# Підсумок зустрічі\n## Коротко\n- Факт\n## Теми\nНемає.\n## Рішення\nНемає.\n## Завдання\nНемає.\n## Відкриті питання\nНемає."
+        if "overview" in schema["properties"]:
+            return json.dumps({"overview": ["Обговорили факти."]})
+        return json.dumps(note("Факти", "Обговорили факти."))
 
 
 def make_manager(tmp_path, busy=lambda: None, release=lambda: None, broadcast=lambda _: None):
@@ -247,6 +311,29 @@ def test_llama_chat_retries_oom_response(tmp_path, monkeypatch):
     monkeypatch.setattr("voice_to_speech.summary.request.urlopen", urlopen)
     assert server.chat([{"role": "user", "content": "Привіт"}], 20) == "Готово"
     assert attempts == [20]
+
+
+def test_llama_chat_passes_schema_and_retries_json_object_on_400(tmp_path, monkeypatch):
+    server = LlamaServer(tmp_path / "server", tmp_path / "model.gguf", tmp_path / "llm.log")
+    server.port, server.key = 12345, "secret"
+    payloads = []
+    class Response:
+        def __enter__(self):
+            return self
+        def __exit__(self, *_):
+            pass
+        def read(self):
+            return b'{"choices":[{"message":{"content":"{}"}}]}'
+    def urlopen(req, **_):
+        payloads.append(json.loads(req.data))
+        if len(payloads) == 1:
+            raise error.HTTPError(req.full_url, 400, "unsupported schema", {}, io.BytesIO(b"unsupported"))
+        return Response()
+    monkeypatch.setattr("voice_to_speech.summary.request.urlopen", urlopen)
+    schema = {"type": "object", "properties": {"items": {"type": "array"}}}
+    assert server.chat([{"role": "user", "content": "Привіт"}], 20, schema=schema) == "{}"
+    assert payloads[0]["response_format"] == {"type": "json_schema", "json_schema": {"name": "meeting_summary", "schema": schema}}
+    assert payloads[1]["response_format"] == {"type": "json_object", "schema": schema}
 
 
 def test_llama_server_fake_script(tmp_path):

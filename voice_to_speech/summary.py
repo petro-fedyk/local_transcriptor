@@ -32,6 +32,21 @@ LANGUAGE = re.compile(r"\s+\([a-zA-Z]{2}\)$")
 SRT_TIME = re.compile(rf"^{TIME}\s*-->\s*{TIME}$")
 THINK = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
 WORD = re.compile(r"\w+(?:['’]\w+)*", re.UNICODE)
+CHUNK_SCHEMA = {
+    "type": "object", "additionalProperties": False,
+    "properties": {
+        "title": {"type": "string"}, "summary": {"type": "string"},
+        "decisions": {"type": "array", "items": {"type": "string"}},
+        "tasks": {"type": "array", "items": {"type": "object", "additionalProperties": False,
+                  "properties": {"who": {"type": "string"}, "what": {"type": "string"}, "due": {"type": "string"}},
+                  "required": ["who", "what", "due"]}},
+        "open_questions": {"type": "array", "items": {"type": "string"}},
+    },
+    "required": ["title", "summary", "decisions", "tasks", "open_questions"],
+}
+OVERVIEW_SCHEMA = {"type": "object", "additionalProperties": False,
+                   "properties": {"overview": {"type": "array", "items": {"type": "string"}}},
+                   "required": ["overview"]}
 
 
 @dataclass(frozen=True)
@@ -312,13 +327,25 @@ class LlamaServer:
                     raise
         raise LlmError("Не вдалося запустити модель.")
 
-    def chat(self, messages, max_tokens, temperature=.3):
-        payload = json.dumps({"model": self.model_path.stem, "messages": messages, "max_tokens": max_tokens, "temperature": temperature}).encode()
+    def chat(self, messages, max_tokens, temperature=.3, schema=None):
+        body = {"model": self.model_path.stem, "messages": messages, "max_tokens": max_tokens, "temperature": temperature}
+        if schema is not None:
+            body["response_format"] = {"type": "json_schema", "json_schema": {"name": "meeting_summary", "schema": schema}}
         while True:
+            payload = json.dumps(body).encode()
             req = request.Request(f"http://127.0.0.1:{self.port}/v1/chat/completions", data=payload, headers={"Content-Type": "application/json", "Authorization": f"Bearer {self.key}"})
             try:
                 with request.urlopen(req, timeout=900) as response:
                     return json.loads(response.read())["choices"][0]["message"]["content"]
+            except error.HTTPError as exc:
+                if exc.code == 400 and schema is not None and body["response_format"]["type"] == "json_schema":
+                    body["response_format"] = {"type": "json_object", "schema": schema}
+                    continue
+                if self.ngl == 0 or not self._oom(exc):
+                    raise LlmError(f"Помилка відповіді моделі: {exc}") from exc
+                self.stop()
+                self.ngl = 20 if self.ngl == 99 else 0
+                self._start()
             except Exception as exc:
                 if self.ngl == 0 or not self._oom(exc):
                     raise LlmError(f"Помилка відповіді моделі: {exc}") from exc
@@ -349,62 +376,193 @@ def _answer(chat, prompt, max_tokens):
     return THINK.sub("", answer).strip()
 
 
-def _final_sections(answer):
+def _clean_summary(text: str) -> str:
+    """Normalize the final Markdown and remove echoed formatting instructions."""
     headings = ("Коротко", "Теми", "Рішення", "Завдання", "Відкриті питання")
     sections = {heading: [] for heading in headings}
     current = None
-    for line in answer.splitlines():
+    instruction = re.compile(r"\s*\([^)]*(?:маркер|реченн|формат|для кожної теми)[^)]*\)", re.IGNORECASE)
+    template_label = re.compile(
+        r"^(?:\*\*\s*(?:Назва|Опис)(?:\s*\([^)]*\))?\s*:?\s*\*\*\s*:?\s*|"
+        r"(?:Назва|Опис)(?:\s*\([^)]*\))?\s*:\s*)",
+        re.IGNORECASE,
+    )
+    for raw_line in text.splitlines():
+        line = instruction.sub("", raw_line).rstrip()
         match = re.fullmatch(r"##\s+(.+?)\s*", line)
         if match:
             if match[1] in sections:
                 current = match[1]
             else:
                 sections[current or "Коротко"].append("### " + match[1])
-        elif line.strip() == "# Підсумок зустрічі":
             continue
-        elif line.startswith("# "):
-            sections[current or "Коротко"].append(line[2:])
-        elif current is not None:
-            sections[current].append(line)
-        elif line.strip():
-            sections["Коротко"].append(line)
+        if line.strip() == "# Підсумок зустрічі":
+            continue
+        if line.startswith("# "):
+            line = line[2:]
+        if current and re.fullmatch(r"#{3,}\s*" + re.escape(current) + r"\s*[:.]?\s*", line, re.IGNORECASE):
+            continue
+        bullet = re.match(r"^(\s*(?:[-*+]\s+|\d+[.)]\s+))(.*)$", line)
+        content = bullet[2] if bullet else line.lstrip()
+        cleaned = template_label.sub("", content)
+        if cleaned != content:
+            line = cleaned if current == "Теми" else (bullet[1] if bullet else "") + cleaned
+        sections[current or "Коротко"].append(line)
+
+    brief = sections["Коротко"]
+    if not any(re.match(r"^\s*[-*+]\s+", line) for line in brief):
+        prose = " ".join(line.strip() for line in brief if line.strip() and line.strip() != "Немає.")
+        if prose and not any(line.lstrip().startswith("### ") for line in brief):
+            sections["Коротко"] = ["- " + sentence.strip() for sentence in re.split(r"(?<=[.!?…])\s+", prose) if sentence.strip()]
     parts = ["# Підсумок зустрічі"]
     for heading in headings:
-        content = "\n".join(sections[heading]).strip() or "Немає."
+        content = re.sub(r"\n{3,}", "\n\n", "\n".join(sections[heading]).strip()) or "Немає."
         parts.append(f"## {heading}\n{content}")
     return "\n\n".join(parts)
 
 
+def _plain(value):
+    """Keep model data on one line and prevent it from adding Markdown structure."""
+    value = re.sub(r"<[^>]*>", " ", value)
+    value = re.sub(r"[`*_#~|>\[\]]", "", value)
+    value = re.sub(r"(?:^|\s)[-+]\s+", " ", value)
+    return " ".join(value.split()).strip()
+
+
+def _json_reply(chat, prompt, schema, cancelled, valid):
+    messages = [
+        {"role": "system", "content": "Відповідай лише JSON українською. Використовуй тільки факти з наданого тексту; не вигадуй осіб, строків чи рішень."},
+        {"role": "user", "content": prompt},
+    ]
+    for temperature in (.3, .1):
+        if cancelled():
+            raise InterruptedError("Підсумок скасовано.")
+        answer = chat(messages, 1200, temperature=temperature, schema=schema)
+        cleaned = THINK.sub("", answer).strip()
+        cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", cleaned, flags=re.IGNORECASE).strip()
+        try:
+            parsed = json.loads(cleaned)
+            if isinstance(parsed, dict) and valid(parsed):
+                return parsed
+        except (TypeError, ValueError):
+            pass
+    return None
+
+
+def _strings(value):
+    return [_plain(item) for item in value if isinstance(item, str) and _plain(item)] if isinstance(value, list) else []
+
+
+def _note(value):
+    if not isinstance(value, dict) or not isinstance(value.get("title"), str) or not isinstance(value.get("summary"), str):
+        return None
+    if any(not isinstance(value.get(key), list) for key in ("decisions", "tasks", "open_questions")):
+        return None
+    tasks = []
+    for task in value["tasks"]:
+        if not isinstance(task, dict) or any(not isinstance(task.get(key), str) for key in ("who", "what", "due")):
+            return None
+        clean = {key: _plain(task[key]) for key in ("who", "what", "due")}
+        if clean["what"]:
+            tasks.append(clean)
+    title = " ".join(_plain(value["title"]).split()[:8])
+    return {"title": title, "summary": _plain(value["summary"]),
+            "decisions": _strings(value["decisions"]), "tasks": tasks,
+            "open_questions": _strings(value["open_questions"])}
+
+
+def _unique(values, key=lambda value: value):
+    result, normalized = [], []
+    for value in values:
+        text = _normalized(key(value))
+        if text and not any(SequenceMatcher(None, text, prior).ratio() >= .85 for prior in normalized):
+            result.append(value)
+            normalized.append(text)
+    return result
+
+
+def _topics(chunks, notes):
+    topics = []
+    for index, chunk in enumerate(chunks):
+        note = notes[str(index)]
+        start = next((row.start for row in chunk if row.start is not None), None)
+        end = next((row.end if row.end is not None else row.start for row in reversed(chunk) if row.start is not None), None)
+        topic = {**note, "start": start, "end": end}
+        if topics and _normalized(topics[-1]["title"]) and SequenceMatcher(
+                None, _normalized(topics[-1]["title"]), _normalized(topic["title"])).ratio() >= .8:
+            previous = topics[-1]
+            previous["summary"] = " ".join(_unique([previous["summary"], topic["summary"]]))
+            previous["end"] = topic["end"] if topic["end"] is not None else previous["end"]
+            for key in ("decisions", "open_questions"):
+                previous[key] = _unique(previous[key] + topic[key])
+            previous["tasks"] = _unique(previous["tasks"] + topic["tasks"],
+                                        lambda task: " ".join(task[key] for key in ("who", "what", "due")))
+        else:
+            topics.append(topic)
+    return topics
+
+
+def _render_summary(topics, overview):
+    decisions = _unique([item for topic in topics for item in topic["decisions"]])
+    tasks = _unique([item for topic in topics for item in topic["tasks"]],
+                    lambda task: " ".join(task[key] for key in ("who", "what", "due")))
+    questions = _unique([item for topic in topics for item in topic["open_questions"]])
+    blocks = ["# Підсумок зустрічі", "## Коротко\n" + ("\n".join("- " + item for item in overview) or "Немає.")]
+    topic_blocks = []
+    previous_end = 0
+    for topic in topics:
+        title = topic["title"] or "Частина"
+        start, end = topic["start"], topic["end"]
+        if start is not None:
+            start = max(start, previous_end)
+            end = max(end if end is not None else start, start)
+            previous_end = end
+            title += f" ({_stamp(start)[:5]}–{_stamp(end)[:5]})"
+        topic_blocks.append("### " + title + "\n" + (topic["summary"] or "Немає."))
+    blocks.append("## Теми\n" + ("\n\n".join(topic_blocks) or "Немає."))
+    blocks.append("## Рішення\n" + ("\n".join("- " + item for item in decisions) or "Немає."))
+    task_lines = ["- [ ] " + " — ".join(part for part in (task["who"], task["what"], task["due"]) if part) for task in tasks]
+    blocks.append("## Завдання\n" + ("\n".join(task_lines) or "Немає."))
+    blocks.append("## Відкриті питання\n" + ("\n".join("- " + item for item in questions) or "Немає."))
+    return "\n\n".join(blocks)
+
+
 def summarize(rows, chat, on_progress, cancelled, state) -> str:
     chunks = chunk_rows(rows)
-    notes = state.setdefault("notes", {})
+    if state.get("format") != 2 or not isinstance(state.get("notes"), dict):
+        state["notes"] = {}
+    state["format"] = 2
+    notes = state["notes"]
     for index, chunk in enumerate(chunks):
         if cancelled():
             raise InterruptedError("Підсумок скасовано.")
-        if str(index) not in notes:
-            start = next((row.start for row in chunk if row.start is not None), None)
-            end = next((row.end or row.start for row in reversed(chunk) if row.start is not None), None)
-            span = f"{_stamp(start)[:5]}–{_stamp(end)[:5]}" if start is not None and end is not None else "без часу"
-            prompt = f"Зроби стислий конспект частини {index + 1} із {len(chunks)}. Почни з «### {span}». Далі маркери: теми, рішення, домовленості/завдання (хто — що — строк, якщо сказано), відкриті питання. Зберігай часові позначки. Не додавай вигаданого.\n\n{format_rows(chunk)}"
-            notes[str(index)] = _answer(chat, prompt, 1200)
+        cached = _note(notes.get(str(index)))
+        if cached is None:
+            prompt = (f"Витягни факти з частини {index + 1} із {len(chunks)}. "
+                      "title: до 8 слів; summary: 1–3 речення; decisions, tasks, open_questions: лише явно згадане. "
+                      "Для невідомого відповідального або строку поверни порожній рядок. Не додавай часові позначки.\n\n"
+                      + format_rows(chunk))
+            parsed = _json_reply(chat, prompt, CHUNK_SCHEMA, cancelled, lambda value: _note(value) is not None)
+            cached = _note(parsed)
+            if cached is None:
+                raw = _plain(" ".join(row.text for row in chunk))[:300]
+                cached = {"title": f"Частина {index + 1}", "summary": raw,
+                          "decisions": [], "tasks": [], "open_questions": []}
+            notes[str(index)] = cached
+        else:
+            notes[str(index)] = cached
         on_progress(index + 1, len(chunks), state)
-    combined = "\n\n".join(notes[str(i)] for i in range(len(chunks)))
-    while len(combined) > 9000:
-        groups = []
-        pieces = [combined[i:i + 8000] for i in range(0, len(combined), 8000)]
-        for piece in pieces:
-            if cancelled():
-                raise InterruptedError("Підсумок скасовано.")
-            groups.append(_answer(chat, "Зведи ці нотатки стисло, зберігаючи факти, рішення, завдання, відкриті питання та часові позначки:\n\n" + piece, 1800))
-        next_combined = "\n\n".join(groups)
-        if len(next_combined) >= len(combined):
-            combined = next_combined[:9000]
-            break
-        combined = next_combined
+    topics = _topics(chunks, notes)
     if cancelled():
         raise InterruptedError("Підсумок скасовано.")
-    prompt = "Створи підсумок зустрічі рівно з такими розділами: # Підсумок зустрічі; ## Коротко (3–6 маркерів); ## Теми (для кожної теми ### Назва (HH:MM–HH:MM) та 1–3 речення); ## Рішення; ## Завдання (формат - [ ] хто — що — строк); ## Відкриті питання. Порожній розділ: Немає. Не вигадуй нічого.\n\n" + combined
-    return _final_sections(_answer(chat, prompt, 3000))
+    overview_input = "\n".join(f"{topic['title']}: {topic['summary'][:180]}" for topic in topics)[:6000]
+    parsed = _json_reply(chat, "Склади 3–6 коротких пунктів огляду лише з цих тем і описів.\n\n" + overview_input,
+                         OVERVIEW_SCHEMA, cancelled,
+                         lambda value: isinstance(value.get("overview"), list)) if topics else None
+    overview = _strings(parsed.get("overview"))[:6] if parsed else []
+    if not overview:
+        overview = _unique([topic["summary"] for topic in topics if topic["summary"]])[:6]
+    return _render_summary(topics, overview)
 
 
 def _atomic_text(path, value):
@@ -593,11 +751,11 @@ class SummaryManager:
         partial = folder / "summary.partial.json"
         try:
             state = json.loads(partial.read_text(encoding="utf-8"))
-            if state.get("source_hash") != source_hash or state.get("chunk_count") != len(chunks):
+            if state.get("source_hash") != source_hash or state.get("chunk_count") != len(chunks) or state.get("format") != 2:
                 state = {}
         except (OSError, ValueError):
             state = {}
-        state.update(source_hash=source_hash, chunk_count=len(chunks))
+        state.update(source_hash=source_hash, chunk_count=len(chunks), format=2)
         state.setdefault("notes", {})
         _atomic_text(partial, json.dumps(state, ensure_ascii=False))
         if job["_cancel"].is_set():
@@ -612,20 +770,26 @@ class SummaryManager:
             job["model_used"] = server.model_used
             self._notify(job, True)
 
-            def chat(messages, max_tokens):
+            def chat(messages, max_tokens, temperature=.3, schema=None):
                 nonlocal server
                 if job["_cancel"].is_set():
                     raise InterruptedError("Підсумок скасовано.")
                 prompt = messages[-1]["content"]
-                if prompt.startswith(("Зведи ці нотатки", "Створи підсумок")):
+                if prompt.startswith("Склади 3–6"):
                     job["stage"] = "Зведення"
-                    job["progress"] = max(job["progress"], .9 if prompt.startswith("Створи підсумок") else .85)
+                    job["progress"] = max(job["progress"], .9)
                     self._notify(job, True)
                 if self.gpu_busy():
                     self._wait_gpu(job, server)
                     server.__enter__()
                     job["model_used"] = server.model_used
-                result = server.chat(messages, max_tokens)
+                try:
+                    result = server.chat(messages, max_tokens, temperature=temperature, schema=schema)
+                except TypeError as exc:
+                    if "unexpected keyword argument" not in str(exc):
+                        raise
+                    # Keep older injected server factories usable by callers.
+                    result = server.chat(messages, max_tokens)
                 job["model_used"] = server.model_used
                 return result
 

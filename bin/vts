@@ -260,8 +260,11 @@ elif model_path.is_file():
 else:
     print(f"Модель підсумку: перевіряю кеш Hugging Face або завантажую {LLM_MODEL_REPO}/{LLM_MODEL_FILE}.")
     from huggingface_hub import hf_hub_download
-    cached_model = Path(hf_hub_download(repo_id=LLM_MODEL_REPO, filename=LLM_MODEL_FILE))
+    # The HF snapshot entry is a relative symlink into blobs/: link the real blob.
+    cached_model = Path(hf_hub_download(repo_id=LLM_MODEL_REPO, filename=LLM_MODEL_FILE)).resolve()
     model_path.parent.mkdir(parents=True, exist_ok=True)
+    if model_path.is_symlink() or model_path.exists():
+        model_path.unlink()
     try:
         os.link(cached_model, model_path)
     except OSError:
